@@ -1,0 +1,8 @@
+{
+  "name": "Vocab Master",
+  "description": "Chinese-Khmer vocabulary learning tool with Edge TTS neural voice pronunciation, Google Sheets synchronization, flashcards, and interactive exercises.",
+  "requestFramePermissions": [],
+  "majorCapabilities": [
+    "MAJOR_CAPABILITY_SERVER_SIDE_GEMINI_API"
+  ]
+}
