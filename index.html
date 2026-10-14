@@ -8721,16 +8721,33 @@ updateAddKhmerClearBtn();  // initial state
 				window.open(currentSheetUrl + "/edit#gid=0&range=D2", "_blank");
 			}
 		};
-		document.getElementById("confirmAddBtn").onclick = () => {
+				document.getElementById("confirmAddBtn").onclick = () => {
 			const chinese = chineseInput.value.trim();
 			const khmer = khmerInput.value.trim();
 			const selectedGroup = groupInput ? groupInput.value.trim() : '';
 			safeSetItem("vocabMaster_RememberedGroup", selectedGroup);
+
+			// Both empty → block
 			if (!chinese && !khmer) {
 				showToast('⚠️ Enter at least one value');
 				chineseInput.focus();
 				return;
 			}
+
+			// One field empty → ask for confirmation first
+			if (!khmer && chinese) {
+				if (!confirm(`⚠️ Khmer field is empty.\n\nAdd "${chinese}" with NO Khmer translation?`)) {
+					khmerInput.focus();
+					return;
+				}
+			} else if (!chinese && khmer) {
+				if (!confirm(`⚠️ Chinese field is empty.\n\nAdd "${khmer}" with NO Chinese word?`)) {
+					chineseInput.focus();
+					return;
+				}
+			}
+
+			// ---- proceed with adding ----
 			chineseInput.value = '';
 			khmerInput.value = '';
 			chineseInput.focus();
