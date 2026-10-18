@@ -143,123 +143,129 @@ function escapeXml(unsafe: string): string {
     .replace(/'/g, '&apos;');
 }
 
-const EDGE_TRUSTED_CLIENT_TOKEN = '6A5AA1D4EAFF4E9FB37E23D68491D6F4';
-const EDGE_WSS_PRIMARY =
-  'wss://api.msedgeservices.com/tts/cognitiveservices/websocket/v1';
-const EDGE_VOICES_PRIMARY = `https://api.msedgeservices.com/tts/cognitiveservices/voices/list?Ocp-Apim-Subscription-Key=${EDGE_TRUSTED_CLIENT_TOKEN}`;
-
-function generateSecMsGec(): string {
-  let ticks = Math.floor(Date.now() / 1000) + 11644473600;
-  ticks -= ticks % 300;
-  const winTicks = BigInt(ticks) * 10000000n;
-  const strToHash = `${winTicks.toString()}${EDGE_TRUSTED_CLIENT_TOKEN}`;
-  return crypto
-    .createHash('sha256')
-    .update(strToHash, 'ascii')
-    .digest('hex')
-    .toUpperCase();
+function getVoiceLocale(voice: string): string {
+  const match = voice.match(/^[a-z]{2,}-[A-Za-z]{2}/);
+  if (match) return match[0];
+  const lower = voice.toLowerCase();
+  if (lower.startsWith('km')) return 'km-KH';
+  if (lower.startsWith('zh-hk')) return 'zh-HK';
+  if (lower.startsWith('zh-tw')) return 'zh-TW';
+  return 'zh-CN';
 }
 
-function getEdgeSynthUrl(): string {
-  const reqId = crypto.randomUUID().replace(/-/g, '');
-  const secMsGEC = generateSecMsGec();
-  return `${EDGE_WSS_PRIMARY}?Ocp-Apim-Subscription-Key=${EDGE_TRUSTED_CLIENT_TOKEN}&Sec-MS-GEC=${secMsGEC}&Sec-MS-GEC-Version=1-143.0.3650.96&ConnectionId=${reqId}`;
+function buildSsml(text: string, voice: string, rate: string): string {
+  const lang = getVoiceLocale(voice);
+  const formattedRate = formatRate(rate);
+  const escapedText = escapeXml(text);
+  return `<speak version="1.0" xmlns="http://www.w3.org/2001/10/synthesis" xmlns:mstts="https://www.w3.org/2001/mstts" xml:lang="${lang}"><voice name="${voice}"><prosody rate="${formattedRate}">${escapedText}</prosody></voice></speak>`;
 }
-
-// Configure MsEdgeTTS to use Microsoft's active api.msedgeservices.com endpoint
-(MsEdgeTTS as unknown as Record<string, unknown>).WSS_URL = EDGE_WSS_PRIMARY;
-(MsEdgeTTS as unknown as Record<string, unknown>).VOICES_URL =
-  EDGE_VOICES_PRIMARY;
-(MsEdgeTTS as unknown as Record<string, unknown>).getSynthUrl =
-  async function () {
-    return getEdgeSynthUrl();
-  };
 
 const ttsAudioCache = new Map<string, Buffer>();
-const MAX_TTS_CACHE_ENTRIES = 300;
+const MAX_TTS_CACHE_ENTRIES = 1000;
 
-async function synthesizeEdgeTtsSingle(
-  text: string,
-  voice: string,
-  rate: string
-): Promise<Buffer> {
-  const tts = new MsEdgeTTS();
-  try {
-    await tts.setMetadata(
-      voice,
-      OUTPUT_FORMAT.AUDIO_24KHZ_48KBITRATE_MONO_MP3,
-      {}
-    );
-    const { audioStream } = tts.toStream(escapeXml(text), {
-      rate: formatRate(rate),
-    });
+let sharedTtsInstance: MsEdgeTTS | null = null;
+let sharedTtsInitPromise: Promise<MsEdgeTTS> | null = null;
 
-    const chunks: Buffer[] = [];
-    await new Promise<void>((resolve, reject) => {
-      const timeout = setTimeout(() => {
-        audioStream.destroy(new Error('Edge TTS stream timed out'));
-        reject(new Error('Edge TTS stream timed out'));
-      }, 12000);
-
-      audioStream.on('data', (chunk: Buffer | Uint8Array) => {
-        chunks.push(Buffer.isBuffer(chunk) ? chunk : Buffer.from(chunk));
-      });
-      audioStream.once('end', () => {
-        clearTimeout(timeout);
-        resolve();
-      });
-      audioStream.once('close', () => {
-        clearTimeout(timeout);
-        resolve();
-      });
-      audioStream.once('error', (err: Error) => {
-        clearTimeout(timeout);
-        reject(err);
-      });
-    });
-
-    const fullBuffer = Buffer.concat(chunks);
-    if (fullBuffer.length < 200) {
-      throw new Error('Generated audio buffer too small');
-    }
-    return fullBuffer;
-  } finally {
+function closeSharedTts() {
+  if (sharedTtsInstance) {
     try {
-      tts.close();
+      sharedTtsInstance.close();
     } catch {
       // ignore close errors
     }
+    sharedTtsInstance = null;
   }
 }
 
-async function synthesizeEdgeTtsBuffer(
+async function getSharedTts(): Promise<MsEdgeTTS> {
+  if (sharedTtsInstance) {
+    const ws = (sharedTtsInstance as unknown as { _ws?: { readyState: number } })
+      ._ws;
+    if (ws && ws.readyState === 1) {
+      return sharedTtsInstance;
+    }
+    closeSharedTts();
+  }
+
+  if (sharedTtsInitPromise) {
+    return sharedTtsInitPromise;
+  }
+
+  sharedTtsInitPromise = (async () => {
+    closeSharedTts();
+    const tts = new MsEdgeTTS({
+      connectionTimeoutMs: 8000,
+      synthesisTimeoutMs: 15000,
+    });
+    await tts.setMetadata(
+      'zh-TW-HsiaoChenNeural',
+      OUTPUT_FORMAT.AUDIO_24KHZ_48KBITRATE_MONO_MP3,
+      {}
+    );
+    sharedTtsInstance = tts;
+    return tts;
+  })().finally(() => {
+    sharedTtsInitPromise = null;
+  });
+
+  return sharedTtsInitPromise;
+}
+
+async function synthesizeEdgeTtsOnce(
   text: string,
   voice: string,
   rate: string
 ): Promise<Buffer> {
-  const formattedRate = formatRate(rate);
-  const cacheKey = `${voice}|${formattedRate}|${text}`;
-  const cached = ttsAudioCache.get(cacheKey);
-  if (cached) {
-    return cached;
-  }
+  const tts = await getSharedTts();
+  const ssml = buildSsml(text, voice, rate);
+  const { audioStream } = tts.rawToStream(ssml);
 
-  // First attempt, retry once on error before falling back
-  let buffer: Buffer;
+  const chunks: Buffer[] = [];
+  return new Promise<Buffer>((resolve, reject) => {
+    const timeout = setTimeout(() => {
+      audioStream.destroy(new Error('Edge TTS stream timed out'));
+      reject(new Error('Edge TTS stream timed out'));
+    }, 12000);
+
+    audioStream.on('data', (chunk: Buffer | Uint8Array) => {
+      chunks.push(Buffer.isBuffer(chunk) ? chunk : Buffer.from(chunk));
+    });
+    audioStream.once('end', () => {
+      clearTimeout(timeout);
+      const fullBuffer = Buffer.concat(chunks);
+      if (fullBuffer.length < 200) {
+        reject(new Error('Generated audio buffer too small'));
+      } else {
+        resolve(fullBuffer);
+      }
+    });
+    audioStream.once('close', () => {
+      clearTimeout(timeout);
+      const fullBuffer = Buffer.concat(chunks);
+      if (fullBuffer.length >= 200) {
+        resolve(fullBuffer);
+      }
+    });
+    audioStream.once('error', (err: Error) => {
+      clearTimeout(timeout);
+      reject(err);
+    });
+  });
+}
+
+async function synthesizeEdgeTtsWithRetry(
+  text: string,
+  voice: string,
+  rate: string
+): Promise<Buffer> {
   try {
-    buffer = await synthesizeEdgeTtsSingle(text, voice, formattedRate);
+    return await synthesizeEdgeTtsOnce(text, voice, rate);
   } catch {
-    buffer = await synthesizeEdgeTtsSingle(text, voice, formattedRate);
+    // On failure or socket reset, recycle the connection and retry once after a short delay
+    closeSharedTts();
+    await new Promise((resolve) => setTimeout(resolve, 350));
+    return await synthesizeEdgeTtsOnce(text, voice, rate);
   }
-
-  if (ttsAudioCache.size >= MAX_TTS_CACHE_ENTRIES) {
-    const oldestKey = ttsAudioCache.keys().next().value;
-    if (oldestKey) {
-      ttsAudioCache.delete(oldestKey);
-    }
-  }
-  ttsAudioCache.set(cacheKey, buffer);
-  return buffer;
 }
 
 async function synthesizeFallbackTtsBuffer(
@@ -387,20 +393,38 @@ async function handleSpeak(req: Request, res: Response) {
       return res.status(400).json({ error: 'No text provided' });
     }
 
+    const formattedRate = formatRate(rate);
+    const cacheKey = `${voice}|${formattedRate}|${text}`;
+    const cached = ttsAudioCache.get(cacheKey);
+    if (cached) {
+      res.setHeader('Content-Type', 'audio/mpeg');
+      res.setHeader('Content-Length', String(cached.length));
+      res.setHeader('Cache-Control', 'public, max-age=86400');
+      return res.send(cached);
+    }
+
     let audioBuffer: Buffer;
     try {
-      audioBuffer = await synthesizeEdgeTtsBuffer(text, voice, rate);
-    } catch (edgeErr) {
-      console.warn(
-        'Edge TTS failed, falling back to Google TTS:',
-        edgeErr instanceof Error ? edgeErr.message : edgeErr
+      audioBuffer = await synthesizeEdgeTtsWithRetry(
+        text,
+        voice,
+        formattedRate
       );
+    } catch {
       audioBuffer = await synthesizeFallbackTtsBuffer(text, voice);
     }
 
+    if (ttsAudioCache.size >= MAX_TTS_CACHE_ENTRIES) {
+      const oldestKey = ttsAudioCache.keys().next().value;
+      if (oldestKey) {
+        ttsAudioCache.delete(oldestKey);
+      }
+    }
+    ttsAudioCache.set(cacheKey, audioBuffer);
+
     res.setHeader('Content-Type', 'audio/mpeg');
     res.setHeader('Content-Length', String(audioBuffer.length));
-    res.setHeader('Cache-Control', 'no-store');
+    res.setHeader('Cache-Control', 'public, max-age=86400');
     return res.send(audioBuffer);
   } catch (err) {
     const msg = err instanceof Error ? err.message : String(err);
