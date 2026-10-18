@@ -1353,6 +1353,7 @@
 			cursor: not-allowed;
 			pointer-events: auto;
 		}
+
 				.side-icons-row {
 					display: flex;
 					gap: 5px;
@@ -12448,12 +12449,106 @@
 			// (insertDataBtn binding moved to top of onload for reliability)
 
 			document.addEventListener('keydown', function(e) {
-				if ((e.ctrlKey || e.metaKey) && e.key === 'f') { e.preventDefault(); requestAddNewVocab(); }
-				if (e.key === 'Escape') {
-					const modals = document.querySelectorAll('.modal-overlay');
-					if (modals.length) { modals.forEach(m => m.remove()); showToast('Closed'); }
-				}
-			});
+    if ((e.ctrlKey || e.metaKey) && e.key === 'f') { e.preventDefault(); requestAddNewVocab(); }
+    if (e.key === 'Escape') {
+        const modals = document.querySelectorAll('.modal-overlay');
+        if (modals.length) { modals.forEach(m => m.remove()); showToast('Closed'); }
+    }
+
+    // ═══════════════════════════════════════════════════════════
+    // ⚡ DELETE KEY SHORTCUT — soft-delete the currently displayed word
+    // ═══════════════════════════════════════════════════════════
+    if (e.key === 'Delete' || e.key === 'Del') {
+        // Ignore if user is typing in an input/textarea/contenteditable
+        const active = document.activeElement;
+        if (active && (
+            active.tagName === 'INPUT' ||
+            active.tagName === 'TEXTAREA' ||
+            active.isContentEditable
+        )) return;
+
+        // Ignore if a modal is open (user is likely editing)
+        if (document.querySelector('.modal-overlay')) return;
+
+        // Resolve the currently displayed word
+        let idx = -1;
+        if (typeof sidebarIndices !== 'undefined' && sidebarIndices.length > 0 &&
+            typeof sidebarFocusIdx !== 'undefined' && sidebarFocusIdx < sidebarIndices.length) {
+            idx = sidebarIndices[sidebarFocusIdx];
+        } else if (typeof appMode !== 'undefined' && appMode === 'sequential' &&
+                   typeof normalCurrentIdx !== 'undefined') {
+            idx = normalCurrentIdx;
+        }
+
+        if (idx === undefined || idx < 0 || !vocabList[idx]) {
+            showToast('⚠️ No word selected to delete');
+            return;
+        }
+        if (softDeletedIndices.has(idx)) {
+            showToast('⚠️ Already in recycle bin');
+            return;
+        }
+
+        e.preventDefault();
+
+        const item = vocabList[idx];
+        const label = item.chinese || item.khmer || `#${getDisplayNumberFromArrayIndex(idx)}`;
+
+        // Use in-app confirm (iOS-safe, works in standalone PWA)
+        const overlay = document.createElement("div");
+        overlay.className = "modal-overlay";
+        overlay.style.zIndex = "35000";
+        overlay.innerHTML = `
+            <div class="choice-modal" style="max-width:420px; background:#1e293b;" onclick="event.stopPropagation()">
+                <h3>🗑️ Delete Word?</h3>
+                <p style="color:#cbd5e1; margin:16px 0; font-size:0.95rem; line-height:1.5;">
+                    Move <strong style="color:#fff;">${escapeHtml(label)}</strong><br>
+                    to the recycle bin?
+                </p>
+                <div class="edit-group-buttons" style="gap:12px;">
+                    <button id="delYesBtn" style="background:#ef4444; color:#fff; flex:1; border:none; border-radius:40px; padding:12px; font-weight:700; cursor:pointer;">🗑️ Delete</button>
+                    <button id="delNoBtn"  style="background:#475569; color:#fff; flex:1; border:none; border-radius:40px; padding:12px; font-weight:700; cursor:pointer;">✕ Cancel</button>
+                </div>
+                <div style="color:#64748b; font-size:0.7rem; margin-top:12px; text-align:center;">
+                    Press <strong style="color:#94a3b8;">Enter</strong> to confirm · <strong style="color:#94a3b8;">Esc</strong> to cancel
+                </div>
+            </div>`;
+        document.body.appendChild(overlay);
+
+        const yesBtn = overlay.querySelector("#delYesBtn");
+        const noBtn  = overlay.querySelector("#delNoBtn");
+
+        const cleanup = () => {
+            document.removeEventListener('keydown', keyHandler, true);
+            overlay.remove();
+        };
+
+        const keyHandler = (ev) => {
+            if (!document.body.contains(overlay)) {
+                document.removeEventListener('keydown', keyHandler, true);
+                return;
+            }
+            if (ev.key === 'Enter') { ev.preventDefault(); ev.stopPropagation(); yesBtn.click(); }
+            else if (ev.key === 'Escape') { ev.preventDefault(); ev.stopPropagation(); noBtn.click(); }
+        };
+        document.addEventListener('keydown', keyHandler, true);
+
+        yesBtn.onclick = (ev) => {
+            ev.stopPropagation();
+            cleanup();
+            softDeleteVocab(idx, item.sheetRow);
+        };
+        noBtn.onclick = (ev) => {
+            ev.stopPropagation();
+            cleanup();
+        };
+        overlay.onclick = (ev) => {
+            if (ev.target === overlay) cleanup();
+        };
+
+        setTimeout(() => { try { yesBtn.focus(); } catch (e) {} }, 50);
+    }
+});
 
 			updateRecycleBinBadge();
 			createGroupFilterUI();
