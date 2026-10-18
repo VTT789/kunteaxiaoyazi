@@ -4028,6 +4028,8 @@ html {
 			// ---- Delete lock to prevent concurrent deletions ----
 			let isDeleting = false;
 			let __writeInProgress = false;
+			
+			
 			let __writeInProgressUntil = 0;   // safety timeout (ms since epoch)
 			let __activeWriteCount = 0;
 			let __writeUnlockTimer = null;
@@ -4772,9 +4774,16 @@ __writeInProgressUntil = Date.now() + 3000;   // was 10000 — 3s is enough
 			}
 			
 			if (parsed.result === "success" || parsed.result === "unknown") {
-				showToast(`✅ ${t} successful`);
-				return true;
-			} else if (parsed.result === "error") {
+    // ✅ Capture hash from our own edit (only when suppression is active)
+    //    Add/delete don't suppress → won't capture → they reload normally
+    if (parsed.contentHash && typeof isEditSuppressed === 'function' && isEditSuppressed()) {
+        window.__suppressReloadHash = parsed.contentHash;
+        lastSelfEditHash = parsed.contentHash;
+        console.log('🔑 Adopted contentHash from edit response:', parsed.contentHash);
+    }
+    showToast(`✅ ${t} successful`);
+    return true;
+} else if (parsed.result === "error") {
 				const errMsg = parsed.message || 'Unknown error';
 				console.warn(`⚠️ ${t} returned error:`, parsed);
 				if (errMsg.includes("does not exist") || errMsg.includes("Cannot delete header")) {
@@ -6801,7 +6810,10 @@ window.addEventListener("orientationchange", function () {
 			openEditGroupInput.value = newGroupName;
 		}
 		
-		saveAllData(true);
+				saveAllData(true);
+		
+		// ✅ Suppress reload — renaming is an edit, not add/delete
+		beginEditSuppression(20000);
 		
 		// Show success message immediately (like Delete All)
 		showToast(`📁 Renamed "${oldGroupName}" → "${newGroupName}" (${indices.length} items)`);
@@ -6844,12 +6856,14 @@ window.addEventListener("orientationchange", function () {
 					showToast(`⚠️ Failed to sync group changes to sheet`);
 				}
 			}
-		} catch (err) {
+				} catch (err) {
 			window.showToast = originalShowToast;
 			if (err.message && !err.message.includes('success')) {
 				showToast(`⚠️ Background sync failed: ${err.message}`);
 			}
 			console.error("Background update error:", err);
+		} finally {
+			endEditSuppression();
 		}
 		
 		return true;
@@ -9510,51 +9524,64 @@ editKhmerClearBtn.addEventListener("click", function (ev) {
 
 updateEditKhmerClearBtn();  // initial state
 		document.getElementById("openSheetRowBtnModal").onclick = () => {
-		requestOpenSheetRow(window.currentEdit.row);
-	};
+    requestOpenSheetRow(window.currentEdit.row);
+};
 
-		const confirmUpdate = () => {
-			const ch = editChineseInput.value.trim();
-			const km = editKhmerInput.value.trim();
-			const selectedGroup = editGroupInput ? editGroupInput.value.trim() : '';
-			safeSetItem("vocabMaster_RememberedGroup", selectedGroup);
-			if (!ch && !km) {
-				showToast("⚠️ At least one field required");
-				return;
-			}
-			a.remove();
-			const idx = window.currentEdit.idx;
-			const row = window.currentEdit.row;
-			const oldKhmer = vocabList[idx]?.khmer || '';
-			const oldChinese = vocabList[idx]?.chinese || '';
+const confirmUpdate = () => {
+    const ch = editChineseInput.value.trim();
+    const km = editKhmerInput.value.trim();
+    const selectedGroup = editGroupInput ? editGroupInput.value.trim() : '';
+    safeSetItem("vocabMaster_RememberedGroup", selectedGroup);
+    if (!ch && !km) {
+        showToast("⚠️ At least one field required");
+        return;
+    }
+    a.remove();
+    const idx = window.currentEdit.idx;
+    const row = window.currentEdit.row;
+    const oldKhmer = vocabList[idx]?.khmer || '';
+    const oldChinese = vocabList[idx]?.chinese || '';
 
-			vocabList[idx] = { khmer: km || oldKhmer, chinese: ch || oldChinese, sheetRow: row, group: selectedGroup || '' };
-			buildFirstCharCache();
-			buildGroupMap();
-			saveAllData(true);
-			renderSidebarUI();
-			updateDisplay();
-			showToast("✅ Updated successfully");
-			refreshAddModalSearch();
+    vocabList[idx] = { khmer: km || oldKhmer, chinese: ch || oldChinese, sheetRow: row, group: selectedGroup || '' };
+    buildFirstCharCache();
+    buildGroupMap();
+    saveAllData(true);
+    renderSidebarUI();
+    updateDisplay();
+    showToast("✅ Updated successfully");
+    refreshAddModalSearch();
 
-			const editInput = document.getElementById('editChineseInput');
-			if (editInput && window.editModalPerformSearch) {
-				window.editModalPerformSearch(editInput.value);
-			}
-			const addInput = document.getElementById('addChineseInput');
-			if (addInput && window.addModalPerformSearch) {
-				window.addModalPerformSearch(addInput.value);
-			}
+    const editInput = document.getElementById('editChineseInput');
+    if (editInput && window.editModalPerformSearch) {
+        window.editModalPerformSearch(editInput.value);
+    }
+    const addInput = document.getElementById('addChineseInput');
+    if (addInput && window.addModalPerformSearch) {
+        window.addModalPerformSearch(addInput.value);
+    }
 
-			updateVocabByRow(row, km || oldKhmer, ch || oldChinese, selectedGroup).catch(err => {
-				const retryFn = () => {
-					return updateVocabByRow(row, km || oldKhmer, ch || oldChinese, selectedGroup);
-				};
-				showRetryToast("retry Tap ⟳", retryFn);
-			});
-		};
-		document.getElementById("confirmUpdateBtn").onclick = () => showPasswordProtectionModal(confirmUpdate,
-			"update vocabulary");
+    // ✅ Suppress reload during and after this edit
+    beginEditSuppression(20000);
+
+    updateVocabByRow(row, km || oldKhmer, ch || oldChinese, selectedGroup)
+        .then(() => {
+            setTimeout(() => {
+                if (typeof window.primeMmsCounterAfterLoad === 'function') {
+                    window.primeMmsCounterAfterLoad();
+                }
+                endEditSuppression();
+            }, 800);
+        })
+        .catch(err => {
+            endEditSuppression();
+            const retryFn = () => {
+                return updateVocabByRow(row, km || oldKhmer, ch || oldChinese, selectedGroup);
+            };
+            showRetryToast("retry Tap ⟳", retryFn);
+        });
+};
+document.getElementById("confirmUpdateBtn").onclick = () => showPasswordProtectionModal(confirmUpdate,
+    "update vocabulary");
 
 		const deleteAction = () => {
 			const idx = window.currentEdit.idx;
@@ -12549,11 +12576,21 @@ let lastSelfEditHash = null;   // ← NEW: remembers the hash we created ourselv
 		};
 
 		// ---- Single combined syncCheck + count check ----
-		async function checkAndReload() {
+				async function checkAndReload() {
 			if (typeof __writeInProgress !== 'undefined' && __writeInProgress) {
 				return;
 			}
 			if (typeof __writeInProgressUntil !== 'undefined' && Date.now() < __writeInProgressUntil) {
+				return;
+			}
+
+			// ⚡ EDIT SUPPRESSION — skip reload, update count silently
+			if (typeof isEditSuppressed === 'function' && isEditSuppressed()) {
+				if (typeof getTotalSidebarCount === 'function') {
+					const t = getTotalSidebarCount();
+					if (t > 0) cachedSheetCount = t;
+				}
+				render();
 				return;
 			}
 
@@ -12614,8 +12651,15 @@ let lastSelfEditHash = null;   // ← NEW: remembers the hash we created ourselv
 				cachedSheetCount = fetchedCount;
 			}
 			if (fetchedHash) {
-				if (lastKnownHash && fetchedHash !== lastKnownHash) {
-					if (lastSelfEditHash && fetchedHash === lastSelfEditHash) {
+								if (lastKnownHash && fetchedHash !== lastKnownHash) {
+					// ⚡ FIRST: recognize our own edit hash (survives long delays)
+					if (window.__suppressReloadHash && fetchedHash === window.__suppressReloadHash) {
+						console.log('✅ Adopted our edit hash — no reload:', fetchedHash);
+						lastKnownHash = fetchedHash;
+						lastSelfEditHash = fetchedHash;
+						window.__suppressReloadHash = null;
+						try { localStorage.setItem('vocabMaster_LastContentHash', lastKnownHash); } catch (e) {}
+					} else if (lastSelfEditHash && fetchedHash === lastSelfEditHash) {
 						console.log('✅ Hash matches our own edit — ignoring');
 						pendingSelfWriteSync = false;
 					} else if (isRecentLocalWrite) {
