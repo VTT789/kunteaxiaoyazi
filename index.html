@@ -4743,7 +4743,7 @@ html {
 		}
 		__activeWriteCount++;
 		__writeInProgress = true;
-__writeInProgressUntil = Date.now() + 3000;   // was 10000 — 3s is enough
+		__writeInProgressUntil = Date.now() + 15000;
 		window.__lastSelfWriteTime = Date.now();
 		
 		const n = { ...e, sheetId: currentSheetId, sheetName: "Sheet1" };
@@ -4802,12 +4802,12 @@ __writeInProgressUntil = Date.now() + 3000;   // was 10000 — 3s is enough
 			if (__activeWriteCount === 0) {
 				if (__writeUnlockTimer) clearTimeout(__writeUnlockTimer);
 				__writeUnlockTimer = setTimeout(() => {
-    __writeUnlockTimer = null;
-    if (__activeWriteCount === 0) {
-        __writeInProgress = false;
-        __writeInProgressUntil = 0;
-    }
-}, 1000);   // was 5000
+					__writeUnlockTimer = null;
+					if (__activeWriteCount === 0) {
+						__writeInProgress = false;
+						__writeInProgressUntil = 0;
+					}
+				}, 3000);
 			}
 		}
 	}
@@ -12429,12 +12429,13 @@ setTimeout(() => {
 		let lastRenderedSidebar = -1;
 		let lastReloadTime = 0;
 		let isReloading = false;
+		let isCheckInProgress = false;
 		let lastKnownModified = 0;   // ⚡ Track sheet edit time
 		let lastKnownHash = localStorage.getItem('vocabMaster_LastContentHash') || null; // ⚡ Persist across reopens
 		let pendingSelfWriteSync = false;
-let lastSelfEditHash = null;   // ← NEW: remembers the hash we created ourselves
-		const MIN_INTERVAL = 1500;          // 3s minimum between API calls
-		const RELOAD_COOLDOWN = 2000;   // was 5000
+		let lastSelfEditHash = null;   // remembers the hash we created ourselves
+		const MIN_INTERVAL = 3500;     // safe interval between API calls
+		const RELOAD_COOLDOWN = 15000; // 15s cooldown strictly prevents duplicate second reload after sheet edit
 		// ---- Sidebar count (excluding soft-deleted) ----
 		function getSidebarCount() {
 			try {
@@ -12543,13 +12544,16 @@ let lastSelfEditHash = null;   // ← NEW: remembers the hash we created ourselv
 		}
 
 		window.primeMmsCounterAfterLoad = function () {
-			pendingSelfWriteSync = true;
-			window.__lastSelfWriteTime = Date.now();
-			primeSyncStateAfterWrite();
+			const totalSidebar = getTotalSidebarCount();
+			if (totalSidebar > 0) {
+				cachedSheetCount = totalSidebar;
+				render();
+			}
 		};
 
 		// ---- Single combined syncCheck + count check ----
 		async function checkAndReload() {
+			if (isCheckInProgress) return;
 			if (typeof __writeInProgress !== 'undefined' && __writeInProgress) {
 				return;
 			}
@@ -12563,131 +12567,150 @@ let lastSelfEditHash = null;   // ← NEW: remembers the hash we created ourselv
 
 			if (getTotalSidebarCount() === 0) return;
 
-			const startVersion = window.__localStateVersion || 0;
-			let contentChanged = false;
-			let gotSyncCount = false;
-			let fetchedCount = null;
-			let fetchedHash = null;
+			isCheckInProgress = true;
 			try {
-				const syncRes = await fetch(detectedApiUrl, {
-					method: 'POST',
-					headers: { 'Content-Type': 'text/plain' },
-					body: JSON.stringify({
-						action: 'syncCheck',
-						sheetId: currentSheetId,
-						sheetName: 'Sheet1'
-					})
-				});
-				const syncData = await syncRes.json();
-				if (syncData && syncData.result === 'success') {
-					if (typeof syncData.count === 'number') {
-						fetchedCount = syncData.count;
-						gotSyncCount = true;
+				const startVersion = window.__localStateVersion || 0;
+				let contentChanged = false;
+				let gotSyncCount = false;
+				let fetchedCount = null;
+				let fetchedHash = null;
+				try {
+					const syncRes = await fetch(detectedApiUrl, {
+						method: 'POST',
+						headers: { 'Content-Type': 'text/plain' },
+						body: JSON.stringify({
+							action: 'syncCheck',
+							sheetId: currentSheetId,
+							sheetName: 'Sheet1'
+						})
+					});
+					const syncData = await syncRes.json();
+					if (syncData && syncData.result === 'success') {
+						if (typeof syncData.count === 'number') {
+							fetchedCount = syncData.count;
+							gotSyncCount = true;
+						}
+						if (syncData.contentHash) {
+							fetchedHash = syncData.contentHash;
+						}
 					}
-					if (syncData.contentHash) {
-						fetchedHash = syncData.contentHash;
-					}
+				} catch (e) {
+					// Network hiccup — ignore
 				}
-			} catch (e) {
-				// Network hiccup — ignore
-			}
 
-			// ⚡ Abort if any local action (soft delete, restore, permanent delete, add, edit) happened while fetch was in flight
-			if ((window.__localStateVersion || 0) !== startVersion) {
-				render();
-				return;
-			}
-			if (typeof __writeInProgress !== 'undefined' && __writeInProgress) {
-				render();
-				return;
-			}
-			if (typeof __writeInProgressUntil !== 'undefined' && Date.now() < __writeInProgressUntil) {
-				render();
-				return;
-			}
-
-			const isRecentLocalWrite = pendingSelfWriteSync ||
-    (typeof window.__lastSelfWriteTime === 'number' &&
-     (Date.now() - window.__lastSelfWriteTime < 8000));   // was 60000
-
-			if (gotSyncCount && fetchedCount !== null) {
-				cachedSheetCount = fetchedCount;
-			}
-			if (fetchedHash) {
-				if (lastKnownHash && fetchedHash !== lastKnownHash) {
-					if (lastSelfEditHash && fetchedHash === lastSelfEditHash) {
-						console.log('✅ Hash matches our own edit — ignoring');
-						pendingSelfWriteSync = false;
-					} else if (isRecentLocalWrite) {
-						console.log('✅ Adopted new sheet contentHash after local edit:', lastKnownHash, '→', fetchedHash);
-						pendingSelfWriteSync = false;
-						lastSelfEditHash = fetchedHash;
-					} else {
-						contentChanged = true;
-						console.log('⚠️ Sheet CONTENT changed:', lastKnownHash, '→', fetchedHash);
-					}
-				}
-				lastKnownHash = fetchedHash;
-				try { localStorage.setItem('vocabMaster_LastContentHash', lastKnownHash); } catch (e) {}
-			}
-
-			if (!gotSyncCount && cachedSheetCount === null) {
-				const sheetCount = await fetchSheetCount();
+				// ⚡ Abort if any local action (soft delete, restore, permanent delete, add, edit) happened while fetch was in flight
 				if ((window.__localStateVersion || 0) !== startVersion) {
 					render();
 					return;
 				}
-				if (sheetCount !== null) cachedSheetCount = sheetCount;
-			}
-			render();
+				if (typeof __writeInProgress !== 'undefined' && __writeInProgress) {
+					render();
+					return;
+				}
+				if (typeof __writeInProgressUntil !== 'undefined' && Date.now() < __writeInProgressUntil) {
+					render();
+					return;
+				}
 
-			if (cachedSheetCount === null) return;
+				// ⚡ STOP resync/reload when edit/update/add vocab was done in HTML!
+				const isRecentLocalWrite = pendingSelfWriteSync ||
+					(typeof window.__lastSelfWriteTime === 'number' &&
+					(Date.now() - window.__lastSelfWriteTime < 60000));
 
-			// ⚡ Recompute sidebarCount & softDeletedCount AFTER network fetch so in-flight soft deletes never mismatch
-			const sidebarCount = getSidebarCount();
-			const softDeletedCount = (typeof softDeletedIndices !== 'undefined' && softDeletedIndices)
-				? softDeletedIndices.size : 0;
-			const effectiveSidebarCount = sidebarCount + softDeletedCount;
+				const sidebarCount = getSidebarCount();
+				const softDeletedCount = (typeof softDeletedIndices !== 'undefined' && softDeletedIndices)
+					? softDeletedIndices.size : 0;
+				const effectiveSidebarCount = sidebarCount + softDeletedCount;
 
-			// If a local write or soft-delete happened within 60s, never auto-reload; trust local state
-			if (isRecentLocalWrite) {
-				cachedSheetCount = effectiveSidebarCount;
-				pendingSelfWriteSync = false;
+				// If an edit/update/add happened in HTML within 60s, NEVER auto-reload; trust local state completely!
+				if (isRecentLocalWrite) {
+					cachedSheetCount = effectiveSidebarCount;
+					pendingSelfWriteSync = false;
+					if (fetchedHash) {
+						lastKnownHash = fetchedHash;
+						lastSelfEditHash = fetchedHash;
+						try { localStorage.setItem('vocabMaster_LastContentHash', lastKnownHash); } catch (e) {}
+					}
+					render();
+					return; // STOP! Never resync/reload on local edit/update in HTML
+				}
+
+				// For external Google Sheet edits: update cachedSheetCount safely without jumping to stale count
+				const timeSinceReload = Date.now() - lastReloadTime;
+				if (gotSyncCount && fetchedCount !== null) {
+					if (timeSinceReload >= RELOAD_COOLDOWN) {
+						cachedSheetCount = fetchedCount;
+					} else {
+						// Recently reloaded: lock cached count to the freshly loaded sidebar count so api NEVER jumps back to old count!
+						cachedSheetCount = effectiveSidebarCount;
+					}
+				}
+
+				if (fetchedHash) {
+					if (lastKnownHash && fetchedHash !== lastKnownHash) {
+						if (lastSelfEditHash && fetchedHash === lastSelfEditHash) {
+							pendingSelfWriteSync = false;
+						} else {
+							contentChanged = true;
+							console.log('⚠️ Sheet CONTENT changed externally:', lastKnownHash, '→', fetchedHash);
+						}
+					}
+					lastKnownHash = fetchedHash;
+					try { localStorage.setItem('vocabMaster_LastContentHash', lastKnownHash); } catch (e) {}
+				}
+
+				if (!gotSyncCount && cachedSheetCount === null) {
+					const sheetCount = await fetchSheetCount();
+					if ((window.__localStateVersion || 0) !== startVersion) {
+						render();
+						return;
+					}
+					if (sheetCount !== null) {
+						if (Date.now() - lastReloadTime >= RELOAD_COOLDOWN) {
+							cachedSheetCount = sheetCount;
+						} else {
+							cachedSheetCount = effectiveSidebarCount;
+						}
+					}
+				}
 				render();
-				return;
+
+				if (cachedSheetCount === null) return;
+
+				// Do NOT trigger reload if we are still within reload cooldown (prevents 2nd reload)
+				if (Date.now() - lastReloadTime < RELOAD_COOLDOWN) return;
+
+				if (effectiveSidebarCount !== cachedSheetCount || contentChanged) {
+					isReloading = true;
+					lastReloadTime = Date.now();
+
+					try {
+						if (typeof showToast === 'function') showToast(`🔄 Syncing...`);
+						if (typeof loadSheetData === 'function' && currentSheetId) {
+							try {
+								localStorage.removeItem('fastVocabCache_' + currentSheetId);
+								localStorage.removeItem('fastVocabCacheTime_' + currentSheetId);
+							} catch (e) {}
+							await loadSheetData(true);
+							const freshTotal = getTotalSidebarCount();
+							cachedSheetCount = freshTotal;
+							if (fetchedHash) {
+								lastKnownHash = fetchedHash;
+								lastSelfEditHash = fetchedHash;
+								try { localStorage.setItem('vocabMaster_LastContentHash', lastKnownHash); } catch (e) {}
+							}
+							render();
+						}
+					} catch (err) {
+						console.error('❌ Reload failed:', err);
+					} finally {
+						isReloading = false;
+						lastReloadTime = Date.now(); // Reset cooldown to strictly block duplicate second reload!
+					}
+				}
+			} finally {
+				isCheckInProgress = false;
 			}
-
-			if (effectiveSidebarCount !== cachedSheetCount || contentChanged) {
-    isReloading = true;
-    lastReloadTime = Date.now();
-
-    // ⚡ Only do a full reload if row count or content hash truly changed
-    // and we're not within 2s of our own last write
-    const sinceLocalWrite = Date.now() - (window.__lastSelfWriteTime || 0);
-
-    if (sinceLocalWrite > 2000) {
-        try {
-            if (typeof showToast === 'function') showToast(`🔄 Syncing...`);
-            if (typeof loadSheetData === 'function' && currentSheetId) {
-                try {
-                    localStorage.removeItem('fastVocabCache_' + currentSheetId);
-                    localStorage.removeItem('fastVocabCacheTime_' + currentSheetId);
-                } catch (e) {}
-                await loadSheetData(true);
-                cachedSheetCount = getTotalSidebarCount();
-                render();
-            }
-        } catch (err) {
-            console.error('❌ Reload failed:', err);
-        } finally {
-            isReloading = false;
-        }
-    } else {
-        // Too soon after our own write — trust local, re-check in 2s
-        isReloading = false;
-        setTimeout(() => refresh(true), 2000);
-    }
-}
 		}
 
 		async function refresh(forceApi) {
@@ -12788,9 +12811,9 @@ let lastSelfEditHash = null;   // ← NEW: remembers the hash we created ourselv
 		// Fallback refresh - poll less often
 		let fallbackTimer = null;
 		function startFallback() {
-    if (fallbackTimer) clearInterval(fallbackTimer);
-    fallbackTimer = setInterval(() => refresh(false), 1500);   // was 3000
-}
+			if (fallbackTimer) clearInterval(fallbackTimer);
+			fallbackTimer = setInterval(() => refresh(false), 4500);
+		}
 		function stopFallback() {
 			if (fallbackTimer) { clearInterval(fallbackTimer); fallbackTimer = null; }
 		}
