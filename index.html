@@ -4057,13 +4057,98 @@
 				let __activeWriteCount = 0;
 				let __writeUnlockTimer = null;
 				window.__lastSelfWriteTime = 0;
+				// ===== MOBILE & DESKTOP AUDIO ENGINE =====
+				let currentAudio = null;
+				let speechQueue = [];
+				let isProcessingQueue = false;
+				let mobileAudioCtx = null;
+				let activeWebAudioSource = null;
+				let sharedEdgeAudio = null;
+				let isMobileAudioUnlocked = false;
+
+				function getMobileAudioContext() {
+					if (!mobileAudioCtx) {
+						const AudioCtx = window.AudioContext || window.webkitAudioContext;
+						if (AudioCtx) {
+							mobileAudioCtx = new AudioCtx();
+						}
+					}
+					return mobileAudioCtx;
+				}
+
+				function getSharedEdgeAudio() {
+					if (!sharedEdgeAudio) {
+						sharedEdgeAudio = document.getElementById("sharedEdgeAudio");
+						if (!sharedEdgeAudio) {
+							sharedEdgeAudio = document.createElement("audio");
+							sharedEdgeAudio.id = "sharedEdgeAudio";
+							sharedEdgeAudio.setAttribute("playsinline", "true");
+							sharedEdgeAudio.setAttribute("webkit-playsinline", "true");
+							sharedEdgeAudio.preload = "auto";
+							sharedEdgeAudio.style.display = "none";
+							document.body.appendChild(sharedEdgeAudio);
+						}
+					}
+					return sharedEdgeAudio;
+				}
+
+				function unlockMobileAudio() {
+					try {
+						const ctx = getMobileAudioContext();
+						if (ctx) {
+							if (ctx.state === "suspended") {
+								ctx.resume().catch(() => {});
+							}
+							if (!ctx.__primed) {
+								const buf = ctx.createBuffer(1, 1, 22050);
+								const src = ctx.createBufferSource();
+								src.buffer = buf;
+								src.connect(ctx.destination);
+								src.start(0);
+								ctx.__primed = true;
+							}
+						}
+					} catch (_) {}
+
+					try {
+						const el = getSharedEdgeAudio();
+						if (el && !isMobileAudioUnlocked) {
+							el.src = "data:audio/wav;base64,UklGRigAAABXQVZFZm10IBIAAAABAAEARKwAAIhYAQACABAAAABkYXRhAgAAAAEA";
+							const p = el.play();
+							if (p && typeof p.then === "function") {
+								p.then(() => {
+									el.pause();
+									isMobileAudioUnlocked = true;
+								}).catch(() => {});
+							} else {
+								isMobileAudioUnlocked = true;
+							}
+						}
+					} catch (_) {}
+				}
+
+				window.unlockMobileAudio = unlockMobileAudio;
+
+				// Global gesture capture listeners to prime audio on first user touch/click
+				["touchstart", "touchend", "pointerdown", "mousedown", "click", "keydown"].forEach((evt) => {
+					window.addEventListener(evt, unlockMobileAudio, { capture: true, passive: true });
+					document.addEventListener(evt, unlockMobileAudio, { capture: true, passive: true });
+				});
+
 				// ---- Speech cancellation token ----
 				let _speechCancelToken = null;
 
 				function _killAudioOnly() {
+					if (activeWebAudioSource) {
+						try { activeWebAudioSource.stop(); } catch (_) {}
+						activeWebAudioSource = null;
+					}
+					if (sharedEdgeAudio) {
+						try { sharedEdgeAudio.pause(); sharedEdgeAudio.currentTime = 0; } catch (_) {}
+					}
 					if (currentAudio) {
-						currentAudio.pause();
-						currentAudio.src = "";
+						try { currentAudio.pause(); } catch (_) {}
+						try { currentAudio.src = ""; } catch (_) {}
 						currentAudio = null;
 					}
 					speechQueue = [];
@@ -4072,9 +4157,7 @@
 
 				// override killAllSpeech to also cancel the speech token
 				const origKillAllSpeech = window.killAllSpeech || function() {
-					currentAudio && (currentAudio.pause(), currentAudio.src = "", currentAudio = null);
-					speechQueue = [];
-					isProcessingQueue = false;
+					_killAudioOnly();
 				};
 
 				window.killAllSpeech = function() {
@@ -4089,6 +4172,7 @@
 
 				// ---- FIXED speakAutoSequence with cancellation token ----
 				async function speakAutoSequence(chinese, khmer) {
+					if (typeof unlockMobileAudio === "function") unlockMobileAudio();
 					// Guard: if no text, just return
 					if (!chinese && !khmer) return;
 
@@ -5522,6 +5606,7 @@
 		}
 
 			  function toggleAuto() {
+			if (typeof unlockMobileAudio === "function") unlockMobileAudio();
 			autoActive = !autoActive;
 			const e = document.getElementById("autoBtn");
 			 if (autoActive) {
@@ -9911,96 +9996,275 @@
 							n +=
 							`<div class="char-block"><div class="pinyin-top"></div><div class="chinese-main">${o}</div><div class="chinese-bottom">${o}</div></div>` } return n }
 				}
-				let currentAudio = null,
-					speechQueue = [],
-					isProcessingQueue = !1;
+				async function callEdgeTTS(text, voice, rate = null) {
+					if (!text) return Promise.resolve();
+					if (typeof unlockMobileAudio === "function") {
+						unlockMobileAudio();
+					}
 
-				async function callEdgeTTS(e, t, n = null) {
-					if (e) try { let o = new URLSearchParams;
-						o.append("text", e), o.append("voice", t), t.startsWith("zh-") && null !== n && o.append("rate", n);
-						const i = await fetch("/speak", { method: "POST", headers: { "Content-Type": "application/x-www-form-urlencoded" },
-								body: o.toString() });
-						if (!i.ok) throw new Error;
-						const a = await i.blob(),
-							r = URL.createObjectURL(a),
-							s = new Audio;
-						return s.src = r, new Promise(((e, t) => { s.onended = () => { URL.revokeObjectURL(r), e() },
-							s.onerror = () => t(), s.play().catch(t), currentAudio && !currentAudio.paused && currentAudio
-							.pause(), currentAudio = s })) } catch (e) { return console.error(e), Promise.reject(e) }
+					try {
+						const params = new URLSearchParams();
+						params.append("text", text);
+						params.append("voice", voice);
+						if (voice && voice.startsWith("zh-") && null !== rate) {
+							params.append("rate", rate);
+						}
+
+						const resp = await fetch("/speak", {
+							method: "POST",
+							headers: { "Content-Type": "application/x-www-form-urlencoded" },
+							body: params.toString()
+						});
+						if (!resp.ok) {
+							throw new Error("TTS fetch HTTP " + resp.status);
+						}
+
+						const arrayBuffer = await resp.arrayBuffer();
+						if (!arrayBuffer || arrayBuffer.byteLength === 0) {
+							throw new Error("TTS empty audio data");
+						}
+
+						// Stop any active Web Audio node
+						if (activeWebAudioSource) {
+							try { activeWebAudioSource.stop(); } catch (_) {}
+							activeWebAudioSource = null;
+						}
+						// Stop any active HTML5 audio
+						if (sharedEdgeAudio) {
+							try { sharedEdgeAudio.pause(); } catch (_) {}
+						}
+						if (currentAudio) {
+							try { currentAudio.pause(); } catch (_) {}
+							currentAudio = null;
+						}
+
+						// Primary engine: Web Audio API (100% reliable after user gesture on iOS Safari / Android Chrome)
+						const ctx = typeof getMobileAudioContext === "function" ? getMobileAudioContext() : null;
+						if (ctx) {
+							if (ctx.state === "suspended") {
+								await ctx.resume().catch(() => {});
+							}
+							try {
+								const audioBuffer = await new Promise((resolve, reject) => {
+									ctx.decodeAudioData(arrayBuffer.slice(0), resolve, reject);
+								});
+
+								return await new Promise((resolve) => {
+									const source = ctx.createBufferSource();
+									source.buffer = audioBuffer;
+									source.connect(ctx.destination);
+									activeWebAudioSource = source;
+
+									let hasEnded = false;
+									const finish = () => {
+										if (hasEnded) return;
+										hasEnded = true;
+										if (activeWebAudioSource === source) {
+											activeWebAudioSource = null;
+										}
+										resolve();
+									};
+
+									source.onended = finish;
+									source.start(0);
+
+									currentAudio = {
+										paused: false,
+										src: "",
+										pause: function() {
+											this.paused = true;
+											try { source.stop(); } catch (_) {}
+											finish();
+										}
+									};
+								});
+							} catch (decodeErr) {
+								console.warn("Web Audio decode failed, falling back to HTMLAudioElement:", decodeErr);
+							}
+						}
+
+						// Fallback engine: Unlocked HTML5 audio element
+						const audioEl = typeof getSharedEdgeAudio === "function" ? getSharedEdgeAudio() : new Audio();
+						const blob = new Blob([arrayBuffer], { type: "audio/mpeg" });
+						const blobUrl = URL.createObjectURL(blob);
+						audioEl.src = blobUrl;
+
+						return await new Promise((resolve, reject) => {
+							let hasEnded = false;
+							const finish = () => {
+								if (hasEnded) return;
+								hasEnded = true;
+								audioEl.onended = null;
+								audioEl.onerror = null;
+								try { URL.revokeObjectURL(blobUrl); } catch (_) {}
+								resolve();
+							};
+
+							audioEl.onended = finish;
+							audioEl.onerror = () => {
+								if (hasEnded) return;
+								hasEnded = true;
+								try { URL.revokeObjectURL(blobUrl); } catch (_) {}
+								reject(new Error("HTMLAudioElement playback error"));
+							};
+
+							const playPromise = audioEl.play();
+							if (playPromise && typeof playPromise.catch === "function") {
+								playPromise.catch((err) => {
+									if (hasEnded) return;
+									hasEnded = true;
+									try { URL.revokeObjectURL(blobUrl); } catch (_) {}
+									reject(err);
+								});
+							}
+
+							currentAudio = {
+								paused: false,
+								src: blobUrl,
+								pause: function() {
+									this.paused = true;
+									try { audioEl.pause(); } catch (_) {}
+									finish();
+								}
+							};
+						});
+					} catch (e) {
+						console.warn("Server TTS error, attempting Web Speech API fallback:", e);
+						if (typeof window !== "undefined" && "speechSynthesis" in window) {
+							try {
+								await new Promise((resolve) => {
+									try {
+										window.speechSynthesis.cancel();
+										const utterance = new SpeechSynthesisUtterance(text);
+										const lowerVoice = (voice || "").toLowerCase();
+										utterance.lang = lowerVoice.startsWith("km")
+											? "km-KH"
+											: lowerVoice.startsWith("zh-tw")
+											? "zh-TW"
+											: lowerVoice.startsWith("zh-hk")
+											? "zh-HK"
+											: "zh-CN";
+										let done = false;
+										const finish = () => {
+											if (done) return;
+											done = true;
+											resolve();
+										};
+										utterance.onend = finish;
+										utterance.onerror = finish;
+										setTimeout(finish, 4000);
+										window.speechSynthesis.speak(utterance);
+									} catch (_) {
+										resolve();
+									}
+								});
+								return;
+							} catch (synthErr) {
+								console.warn("Web Speech API fallback failed:", synthErr);
+							}
+						}
+						return Promise.reject(e);
+					}
 				}
 
 				async function processSpeechQueue() {
 					if (!isProcessingQueue && 0 !== speechQueue.length) {
-						for (isProcessingQueue = !0; speechQueue.length;) { const { text: e, voice: t, rate: n } = speechQueue
-								.shift(); try { await callEdgeTTS(e, t, n), await new Promise((e => setTimeout(e, 0))) } catch (
-								e) { console.warn(e) } }
-						isProcessingQueue = !1
+						for (isProcessingQueue = !0; speechQueue.length;) {
+							const { text: e, voice: t, rate: n } = speechQueue.shift();
+							try {
+								await callEdgeTTS(e, t, n);
+								await new Promise((e => setTimeout(e, 0)));
+							} catch (e) {
+								console.warn(e);
+							}
+						}
+						isProcessingQueue = !1;
 					}
 				}
 
-				function enqueueSpeech(e, t, n = null) { e && (speechQueue.push({ text: e, voice: t, rate: n }), processSpeechQueue()) }
+				function enqueueSpeech(e, t, n = null) {
+					if (e) {
+						if (typeof unlockMobileAudio === "function") unlockMobileAudio();
+						speechQueue.push({ text: e, voice: t, rate: n });
+						processSpeechQueue();
+					}
+				}
 
 				function speakChineseEdge(e) {
 					if (!e) return;
-					const t = document.getElementById("zhVoiceSelect").value,
-						n = document.getElementById("zhRateSlider");
+					if (typeof unlockMobileAudio === "function") unlockMobileAudio();
+					const t = document.getElementById("zhVoiceSelect").value;
+					const n = document.getElementById("zhRateSlider");
 					let o = n ? parseInt(n.value) : 0;
-					enqueueSpeech(e, t, 0 === o ? "0%" : o > 0 ? "+" + o + "%" : o + "%")
+					enqueueSpeech(e, t, 0 === o ? "0%" : o > 0 ? "+" + o + "%" : o + "%");
 				}
 
-				function speakKhmerEdge(e) { if (!e) return;
-					enqueueSpeech(e, document.getElementById("kmVoiceSelect").value, null) }
-
-			  function speakChineseFromMain() {
-			const e = document.getElementById("chineseWord");
-			const t = (e && e.getAttribute("data-plain")) || "";
-			if (!t) return;
-
-			killAllSpeech();
-
-			const reps = Math.max(1, parseInt(document.getElementById("zhReps").value) || 1);
-			const voice = document.getElementById("zhVoiceSelect").value;
-			const rateSlider = document.getElementById("zhRateSlider");
-			let rate = rateSlider ? parseInt(rateSlider.value) : 0;
-			let rateStr = rate === 0 ? "0%" : (rate > 0 ? "+" + rate + "%" : rate + "%");
-
-			(async () => {
-				for (let i = 0; i < reps; i++) {
-					try {
-						await callEdgeTTS(t, voice, rateStr);
-					} catch (err) {
-						console.warn("ZH TTS error:", err);
-					}
-					if (i < reps - 1) {
-						await new Promise(r => setTimeout(r, 50));
-					}
+				function speakKhmerEdge(e) {
+					if (!e) return;
+					if (typeof unlockMobileAudio === "function") unlockMobileAudio();
+					enqueueSpeech(e, document.getElementById("kmVoiceSelect").value, null);
 				}
-			})();
-		}
 
-			   function speakKhmerFromMain() {
-			const e = document.getElementById("khmerWord");
-			const t = e ? e.innerText : "";
-			if (!t) return;
+				function speakChineseFromMain() {
+					if (typeof unlockMobileAudio === "function") unlockMobileAudio();
+					const e = document.getElementById("chineseWord");
+					const t = (e && e.getAttribute("data-plain")) || "";
+					if (!t) return;
 
-			killAllSpeech();
+					killAllSpeech();
+					const token = { cancelled: false };
+					_speechCancelToken = token;
 
-			const reps = Math.max(1, parseInt(document.getElementById("kmReps").value) || 1);
-			const voice = document.getElementById("kmVoiceSelect").value;
+					const reps = Math.max(1, parseInt(document.getElementById("zhReps").value) || 1);
+					const voice = document.getElementById("zhVoiceSelect").value;
+					const rateSlider = document.getElementById("zhRateSlider");
+					let rate = rateSlider ? parseInt(rateSlider.value) : 0;
+					let rateStr = rate === 0 ? "0%" : (rate > 0 ? "+" + rate + "%" : rate + "%");
 
-			(async () => {
-				for (let i = 0; i < reps; i++) {
-					try {
-						await callEdgeTTS(t, voice, null);
-					} catch (err) {
-						console.warn("KM TTS error:", err);
-					}
-					if (i < reps - 1) {
-						await new Promise(r => setTimeout(r, 50));
-					}
+					(async () => {
+						for (let i = 0; i < reps; i++) {
+							if (token.cancelled) break;
+							try {
+								await callEdgeTTS(t, voice, rateStr);
+							} catch (err) {
+								if (!token.cancelled) console.warn("ZH TTS error:", err);
+							}
+							if (token.cancelled) break;
+							if (i < reps - 1) {
+								await new Promise(r => setTimeout(r, 50));
+							}
+						}
+					})();
 				}
-			})();
-		}
+
+				function speakKhmerFromMain() {
+					if (typeof unlockMobileAudio === "function") unlockMobileAudio();
+					const e = document.getElementById("khmerWord");
+					const t = e ? e.innerText : "";
+					if (!t) return;
+
+					killAllSpeech();
+					const token = { cancelled: false };
+					_speechCancelToken = token;
+
+					const reps = Math.max(1, parseInt(document.getElementById("kmReps").value) || 1);
+					const voice = document.getElementById("kmVoiceSelect").value;
+
+					(async () => {
+						for (let i = 0; i < reps; i++) {
+							if (token.cancelled) break;
+							try {
+								await callEdgeTTS(t, voice, null);
+							} catch (err) {
+								if (!token.cancelled) console.warn("KM TTS error:", err);
+							}
+							if (token.cancelled) break;
+							if (i < reps - 1) {
+								await new Promise(r => setTimeout(r, 50));
+							}
+						}
+					})();
+				}
 
 				let speechOrder = 'zh_first';
 
